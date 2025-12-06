@@ -1,0 +1,552 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>E-Money LLM Debate</title>
+    
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        zinc: {
+                            850: '#1f1f22',
+                            900: '#18181b',
+                            950: '#09090b',
+                        }
+                    },
+                    fontFamily: {
+                        sans: ['Inter', 'system-ui', 'sans-serif'],
+                        mono: ['JetBrains Mono', 'Menlo', 'monospace'],
+                    }
+                }
+            }
+        }
+    </script>
+    
+    <!-- React & ReactDOM -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    
+    <!-- Babel for JSX -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    
+    <!-- Markdown Renderer -->
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+
+    <!-- Icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+
+    <style>
+        body { background-color: #09090b; color: #e4e4e7; font-family: 'Inter', sans-serif; overflow: hidden; }
+        
+        /* Custom Scrollbar */
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: #18181b; }
+        ::-webkit-scrollbar-thumb { background: #3f3f46; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #52525b; }
+
+        .markdown-body p { margin-bottom: 0.75rem; line-height: 1.6; }
+        .markdown-body ul { list-style-type: disc; margin-left: 1.5rem; margin-bottom: 0.75rem; }
+        .markdown-body ol { list-style-type: decimal; margin-left: 1.5rem; margin-bottom: 0.75rem; }
+        .markdown-body strong { color: #fff; font-weight: 600; }
+        .markdown-body blockquote { border-left: 2px solid #52525b; padding-left: 1rem; color: #a1a1aa; font-style: italic; }
+
+        .typing-cursor::after {
+            content: '▋';
+            animation: blink 1s step-start infinite;
+            color: #a1a1aa;
+        }
+        @keyframes blink { 50% { opacity: 0; } }
+        
+        /* Utility */
+        .no-resize { resize: none; }
+    </style>
+
+    <!-- WebLLM Loader -->
+    <script type="module">
+        import * as webllm from "https://esm.run/@mlc-ai/web-llm";
+        window.webllm = webllm;
+    </script>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef } = React;
+
+        // --- Configuration Constants ---
+        const MODEL_VERSION = "v0_2_80";
+        const MODEL_LIB_PREFIX = "https://raw.githubusercontent.com/mlc-ai/binary-mlc-llm-libs/main/web-llm-models/";
+        
+        const MODELS = {
+            standard: {
+                id: "Llama-3.2-3B-Instruct-q4f16_1-MLC",
+                url: "https://huggingface.co/mlc-ai/Llama-3.2-3B-Instruct-q4f16_1-MLC",
+                lib: "Llama-3.2-3B-Instruct-q4f16_1-ctx4k_cs1k-webgpu.wasm",
+                context_size: 4096,
+                vram: "~2.3GB"
+            },
+            low_vram: {
+                id: "Llama-3.2-1B-Instruct-q4f16_1-MLC",
+                url: "https://huggingface.co/mlc-ai/Llama-3.2-1B-Instruct-q4f16_1-MLC",
+                lib: "Llama-3.2-1B-Instruct-q4f16_1-ctx4k_cs1k-webgpu.wasm",
+                context_size: 2048,
+                vram: "~880MB"
+            }
+        };
+
+        // --- UI Components ---
+
+        const Icon = ({ name, className }) => <i className={`fas fa-${name} ${className || ''}`}></i>;
+
+        const SidebarInput = ({ label, value, onChange, type = "text", rows = 3, placeholder }) => (
+            <div className="mb-4">
+                <label className="block text-xs font-semibold text-zinc-500 uppercase tracking-wider mb-1.5">{label}</label>
+                {type === "textarea" ? (
+                    <textarea 
+                        className="w-full bg-zinc-900 border border-zinc-700 rounded-sm p-2 text-xs text-zinc-300 focus:border-zinc-500 focus:outline-none focus:ring-0 transition-colors no-resize font-mono leading-relaxed"
+                        rows={rows}
+                        value={value}
+                        onChange={onChange}
+                        placeholder={placeholder}
+                    />
+                ) : (
+                    <input 
+                        type={type} 
+                        className="w-full bg-zinc-900 border border-zinc-700 rounded-sm p-2 text-xs text-zinc-300 focus:border-zinc-500 focus:outline-none focus:ring-0 transition-colors"
+                        value={value}
+                        onChange={onChange}
+                        placeholder={placeholder}
+                    />
+                )}
+            </div>
+        );
+
+        const DebateEntry = ({ msg, isAgentA }) => {
+            const borderColor = isAgentA ? "border-blue-900/50" : "border-orange-900/50";
+            const headerColor = isAgentA ? "text-blue-400" : "text-orange-400";
+            const roleLabel = isAgentA ? "Proponent" : "Opponent";
+            const icon = isAgentA ? "circle-check" : "circle-xmark";
+
+            return (
+                <div className={`group border-l-2 ${borderColor} pl-4 md:pl-6 py-2 hover:bg-zinc-900/30 transition-colors`}>
+                    <div className="flex items-baseline gap-3 mb-1">
+                        <span className={`text-sm font-bold ${headerColor} flex items-center gap-2`}>
+                            <Icon name={icon} className="text-xs opacity-70" />
+                            {msg.name}
+                        </span>
+                        <span className="text-[10px] uppercase font-mono text-zinc-600">{roleLabel}</span>
+                    </div>
+                    <div 
+                        className="markdown-body text-zinc-300 text-sm leading-6"
+                        dangerouslySetInnerHTML={{ __html: marked.parse(msg.content) }}
+                    />
+                </div>
+            );
+        };
+
+        const StatusFooter = ({ status, modelInfo }) => {
+            return (
+                <footer className="h-8 bg-zinc-950 border-t border-zinc-800 flex items-center px-4 text-[10px] text-zinc-500 select-none justify-between">
+                    <div className="flex items-center gap-4">
+                        <span className="flex items-center gap-2">
+                            <div className={`w-2 h-2 rounded-full ${status.loading ? 'bg-yellow-500 animate-pulse' : 'bg-green-600'}`}></div>
+                            {status.text || "Ready"}
+                        </span>
+                        {status.progress > 0 && status.progress < 1 && (
+                            <div className="w-24 bg-zinc-800 h-1.5 rounded-full overflow-hidden">
+                                <div className="bg-zinc-400 h-full" style={{ width: `${status.progress * 100}%` }}></div>
+                            </div>
+                        )}
+                    </div>
+                    <div className="font-mono flex gap-4">
+                        <span>VRAM: {modelInfo?.vram || "--"}</span>
+                        <span>CTX: {modelInfo?.context_size || "--"}</span>
+                        <span>WEBLLM</span>
+                    </div>
+                </footer>
+            );
+        };
+
+        const App = () => {
+            const [engine, setEngine] = useState(null);
+            const [currentModelId, setCurrentModelId] = useState(null);
+            const [loadingState, setLoadingState] = useState({ loading: false, text: "System Standby", progress: 0 });
+            const [isRunning, setIsRunning] = useState(false);
+            const [transcript, setTranscript] = useState([]);
+            const [streamingContent, setStreamingContent] = useState("");
+            const [currentTurn, setCurrentTurn] = useState(null); // 'A' or 'B'
+            const stopSignal = useRef(false);
+            const chatContainerRef = useRef(null);
+
+            const [config, setConfig] = useState({
+                topic: "Is Capitalism better than Socialism?",
+                lowVram: false,
+                agentA_name: "Michael",
+                agentA_prompt: "You are Michael, a staunch conservative from Georgia. You believe in free markets, limited government, and individual liberty. You are debating a socialist. Be firm but respectful. Keep answers under 100 words.",
+                agentB_name: "Sarah",
+                agentB_prompt: "You are Sarah, a progressive sociology professor from Vermont. You believe in social equity, wealth redistribution, and strong safety nets. You are debating a capitalist. Be intellectual and citing historical examples. Keep answers under 100 words."
+            });
+
+            // Initialize Engine
+            const initEngine = async () => {
+                const targetConfig = config.lowVram ? MODELS.low_vram : MODELS.standard;
+                
+                if (engine && currentModelId === targetConfig.id) return engine;
+                
+                try {
+                    setLoadingState({ loading: true, text: "Loading Model Weights...", progress: 0.05 });
+                    
+                    if (!window.webllm) throw new Error("WebLLM library not loaded.");
+
+                    const appConfig = {
+                        model_list: [{
+                            model: targetConfig.url,
+                            model_id: targetConfig.id,
+                            model_lib: MODEL_LIB_PREFIX + MODEL_VERSION + "/" + targetConfig.lib,
+                            vram_required_MB: config.lowVram ? 880 : 2263,
+                            low_resource_required: true,
+                            overrides: { context_window_size: targetConfig.context_size },
+                        }]
+                    };
+
+                    const newEngine = await window.webllm.CreateMLCEngine(
+                        targetConfig.id,
+                        { 
+                            appConfig, 
+                            initProgressCallback: (report) => {
+                                setLoadingState({ loading: true, text: report.text, progress: report.progress });
+                            }
+                        }
+                    );
+                    
+                    setEngine(newEngine);
+                    setCurrentModelId(targetConfig.id);
+                    setLoadingState({ loading: false, text: "Engine Ready", progress: 1 });
+                    return newEngine;
+                } catch (err) {
+                    setLoadingState({ loading: false, text: "Error: " + err.message, progress: 0 });
+                    return null;
+                }
+            };
+
+            const generateResponse = async (activeEngine, promptSystem, history, currentSpeakerName, opponentName) => {
+                const messages = [
+                    { role: "system", content: `${promptSystem}\n\nContext: You are ${currentSpeakerName} debating ${opponentName}. Topic: "${config.topic}".` }
+                ];
+
+                if (history.length === 0) {
+                    messages.push({ role: "user", content: `Opening statement regarding: ${config.topic}.` });
+                } else {
+                    history.forEach(msg => {
+                        const role = msg.name === currentSpeakerName ? "assistant" : "user";
+                        messages.push({ role: role, content: msg.content });
+                    });
+                }
+
+                try {
+                    const completion = await activeEngine.chat.completions.create({
+                        messages, temperature: 0.7, max_tokens: 256, stream: true,
+                    });
+
+                    let fullContent = "";
+                    for await (const chunk of completion) {
+                        if (stopSignal.current) {
+                            await activeEngine.interruptGenerate();
+                            break;
+                        }
+                        const delta = chunk.choices[0].delta.content;
+                        if (delta) {
+                            fullContent += delta;
+                            setStreamingContent(fullContent);
+                            scrollToBottom();
+                        }
+                    }
+                    return fullContent;
+                } catch (e) {
+                    console.error("Generation failed", e);
+                    return "[Data Corruption]";
+                }
+            };
+
+            const runDebateStep = async (loadedEngine, currentTranscript, turn) => {
+                if (stopSignal.current) {
+                    setIsRunning(false);
+                    setStreamingContent("");
+                    return;
+                }
+
+                setCurrentTurn(turn);
+                const isAgentA = turn === 'A';
+                const name = isAgentA ? config.agentA_name : config.agentB_name;
+                const prompt = isAgentA ? config.agentA_prompt : config.agentB_prompt;
+                const opponentName = isAgentA ? config.agentB_name : config.agentA_name;
+
+                const responseContent = await generateResponse(loadedEngine, prompt, currentTranscript, name, opponentName);
+
+                if (stopSignal.current) {
+                    setIsRunning(false);
+                    setStreamingContent("");
+                    return;
+                }
+
+                const newMessage = { name, content: responseContent, isAgentA };
+                const newTranscript = [...currentTranscript, newMessage];
+                
+                setTranscript(newTranscript);
+                setStreamingContent("");
+                
+                // Small delay between turns
+                setTimeout(() => {
+                    runDebateStep(loadedEngine, newTranscript, isAgentA ? 'B' : 'A');
+                }, 800);
+            };
+
+            const toggleDebate = async () => {
+                if (isRunning) {
+                    stopSignal.current = true;
+                    setIsRunning(false);
+                } else {
+                    stopSignal.current = false;
+                    const loadedEngine = await initEngine();
+                    if (!loadedEngine) return;
+                    setIsRunning(true);
+                    
+                    // Only clear transcript if starting fresh from 0
+                    if(transcript.length === 0) {
+                        runDebateStep(loadedEngine, [], 'A');
+                    } else {
+                        // Determine whose turn it is
+                        const lastWasA = transcript[transcript.length-1].isAgentA;
+                        runDebateStep(loadedEngine, transcript, lastWasA ? 'B' : 'A');
+                    }
+                }
+            };
+
+            const resetDebate = () => {
+                stopSignal.current = true;
+                setIsRunning(false);
+                setTranscript([]);
+                setStreamingContent("");
+                setCurrentTurn(null);
+            };
+
+            const scrollToBottom = () => {
+                if (chatContainerRef.current) {
+                    chatContainerRef.current.scrollTop = chatContainerRef.current.scrollHeight;
+                }
+            };
+            
+            useEffect(() => { scrollToBottom(); }, [transcript]);
+
+            const downloadTranscript = () => {
+                const text = transcript.map(t => `${t.name}: ${t.content}`).join('\n\n');
+                const blob = new Blob([text], { type: 'text/plain' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = 'debate_transcript.txt';
+                a.click();
+            };
+
+            return (
+                <div className="flex flex-col h-screen bg-zinc-950 text-zinc-300 overflow-hidden">
+                    
+                    {/* Top Bar / Toolbar */}
+                    <header className="h-12 border-b border-zinc-800 bg-zinc-900/50 flex items-center justify-between px-4 shrink-0">
+                        <div className="flex items-center gap-3">
+                            <div className="w-5 h-5 bg-zinc-100 rounded-sm flex items-center justify-center text-zinc-900 font-bold text-xs">
+                                <Icon name="terminal" />
+                            </div>
+                            <h1 className="text-sm font-semibold tracking-wide text-zinc-100">E-MONEY LLM DEBATE <span className="text-zinc-500 font-normal">v1.0</span></h1>
+                        </div>
+                        <div className="flex gap-2">
+                            <button 
+                                onClick={downloadTranscript}
+                                disabled={transcript.length === 0}
+                                className="px-3 py-1.5 text-xs font-medium bg-zinc-800 hover:bg-zinc-700 text-zinc-300 rounded-sm border border-zinc-700 transition disabled:opacity-50"
+                            >
+                                <Icon name="download" className="mr-1" /> Export
+                            </button>
+                            <button 
+                                onClick={resetDebate}
+                                className="px-3 py-1.5 text-xs font-medium bg-zinc-800 hover:bg-zinc-700 text-red-400 rounded-sm border border-zinc-700 transition"
+                            >
+                                <Icon name="trash" className="mr-1" /> Clear
+                            </button>
+                        </div>
+                    </header>
+
+                    <div className="flex flex-1 overflow-hidden">
+                        
+                        {/* Sidebar: Configuration */}
+                        <aside className="w-80 bg-zinc-900 border-r border-zinc-800 flex flex-col shrink-0 overflow-y-auto z-10">
+                            <div className="p-4 border-b border-zinc-800">
+                                <h2 className="text-xs font-bold text-zinc-400 uppercase tracking-widest mb-4">Configuration</h2>
+                                
+                                <SidebarInput 
+                                    label="Debate Topic" 
+                                    value={config.topic}
+                                    onChange={(e) => setConfig({...config, topic: e.target.value})}
+                                    rows={2}
+                                    type="textarea"
+                                    placeholder="Enter topic..."
+                                />
+
+                                <div className="flex items-center justify-between bg-zinc-950 p-2 rounded border border-zinc-800 mb-4">
+                                    <div className="text-xs">
+                                        <div className="font-semibold text-zinc-300">Resource Mode</div>
+                                        <div className="text-zinc-600">{config.lowVram ? "1B Model (Low VRAM)" : "3B Model (Standard)"}</div>
+                                    </div>
+                                    <button 
+                                        onClick={() => setConfig({...config, lowVram: !config.lowVram})}
+                                        className={`w-8 h-4 rounded-full relative transition-colors ${config.lowVram ? 'bg-green-600' : 'bg-zinc-700'}`}
+                                    >
+                                        <div className={`absolute top-0.5 left-0.5 w-3 h-3 bg-white rounded-full transition-transform duration-200 ${config.lowVram ? 'translate-x-4' : 'translate-x-0'}`}></div>
+                                    </button>
+                                </div>
+                            </div>
+
+                            <div className="p-4 flex-1 overflow-y-auto space-y-6">
+                                {/* Agent A Config */}
+                                <div>
+                                    <div className="flex items-center gap-2 mb-2 text-blue-400 text-xs font-bold uppercase">
+                                        <Icon name="user-tie" /> Agent A (Proponent)
+                                    </div>
+                                    <SidebarInput 
+                                        label="Name" 
+                                        value={config.agentA_name} 
+                                        onChange={(e) => setConfig({...config, agentA_name: e.target.value})} 
+                                    />
+                                    <SidebarInput 
+                                        label="System Prompt" 
+                                        type="textarea"
+                                        rows={4}
+                                        value={config.agentA_prompt} 
+                                        onChange={(e) => setConfig({...config, agentA_prompt: e.target.value})} 
+                                    />
+                                </div>
+
+                                {/* Agent B Config */}
+                                <div>
+                                    <div className="flex items-center gap-2 mb-2 text-orange-400 text-xs font-bold uppercase">
+                                        <Icon name="user-graduate" /> Agent B (Opponent)
+                                    </div>
+                                    <SidebarInput 
+                                        label="Name" 
+                                        value={config.agentB_name} 
+                                        onChange={(e) => setConfig({...config, agentB_name: e.target.value})} 
+                                    />
+                                    <SidebarInput 
+                                        label="System Prompt" 
+                                        type="textarea"
+                                        rows={4}
+                                        value={config.agentB_prompt} 
+                                        onChange={(e) => setConfig({...config, agentB_prompt: e.target.value})} 
+                                    />
+                                </div>
+                            </div>
+
+                            <div className="p-4 border-t border-zinc-800 bg-zinc-900">
+                                <button 
+                                    onClick={toggleDebate}
+                                    disabled={loadingState.loading && loadingState.progress < 1}
+                                    className={`w-full py-2.5 px-4 text-xs font-bold uppercase tracking-wider rounded-sm transition flex items-center justify-center gap-2
+                                        ${isRunning 
+                                            ? 'bg-zinc-800 text-red-400 border border-zinc-700 hover:bg-zinc-700' 
+                                            : 'bg-zinc-100 text-zinc-900 hover:bg-white'}
+                                        ${loadingState.loading ? 'opacity-50 cursor-not-allowed' : ''}
+                                    `}
+                                >
+                                    {loadingState.loading ? (
+                                        <><Icon name="spinner" className="fa-spin" /> Initializing</>
+                                    ) : isRunning ? (
+                                        <><Icon name="pause" /> Pause Debate</>
+                                    ) : (
+                                        <><Icon name="play" /> Start Debate</>
+                                    )}
+                                </button>
+                            </div>
+                        </aside>
+
+                        {/* Main Content: Transcript */}
+                        <main className="flex-1 bg-zinc-950 flex flex-col relative min-w-0">
+                            {transcript.length === 0 && !streamingContent && !loadingState.loading ? (
+                                <div className="flex-1 flex flex-col items-center justify-center text-zinc-600 select-none">
+                                    <div className="w-16 h-16 border-2 border-zinc-800 rounded-lg flex items-center justify-center mb-4">
+                                        <Icon name="comments" className="text-2xl" />
+                                    </div>
+                                    <p className="text-sm">Configure agents and click Start to begin.</p>
+                                </div>
+                            ) : (
+                                <div 
+                                    ref={chatContainerRef}
+                                    className="flex-1 overflow-y-auto p-0 scroll-smooth"
+                                >
+                                    <div className="max-w-4xl mx-auto py-8 px-8">
+                                        {/* Transcript Items */}
+                                        {transcript.map((msg, idx) => (
+                                            <div key={idx} className="mb-6">
+                                                <DebateEntry msg={msg} isAgentA={msg.isAgentA} />
+                                            </div>
+                                        ))}
+
+                                        {/* Active Streaming Item */}
+                                        {streamingContent && (
+                                             <div className="mb-6">
+                                                <DebateEntry 
+                                                    msg={{ name: currentTurn === 'A' ? config.agentA_name : config.agentB_name, content: streamingContent }} 
+                                                    isAgentA={currentTurn === 'A'} 
+                                                />
+                                            </div>
+                                        )}
+                                        
+                                        {/* Thinking Indicator */}
+                                        {!streamingContent && isRunning && (
+                                            <div className="pl-6 py-2 flex items-center gap-2 text-zinc-500 text-xs font-mono">
+                                                <Icon name="microchip" />
+                                                <span className="typing-cursor">
+                                                    {currentTurn === 'A' ? config.agentA_name : config.agentB_name} is thinking
+                                                </span>
+                                            </div>
+                                        )}
+                                    </div>
+                                </div>
+                            )}
+
+                            {/* Loading Overlay (First Load Only) */}
+                            {loadingState.loading && loadingState.progress < 1 && (
+                                <div className="absolute inset-0 bg-zinc-950/80 backdrop-blur-sm z-50 flex items-center justify-center">
+                                    <div className="w-64">
+                                        <div className="flex justify-between text-xs text-zinc-400 mb-2 font-mono">
+                                            <span>INITIALIZING_RUNTIME</span>
+                                            <span>{Math.round(loadingState.progress * 100)}%</span>
+                                        </div>
+                                        <div className="h-1 bg-zinc-800 w-full overflow-hidden">
+                                            <div className="h-full bg-blue-500 transition-all duration-200" style={{ width: `${loadingState.progress * 100}%` }}></div>
+                                        </div>
+                                        <div className="mt-2 text-[10px] text-zinc-600 text-center">{loadingState.text}</div>
+                                    </div>
+                                </div>
+                            )}
+                        </main>
+                    </div>
+
+                    <StatusFooter 
+                        status={loadingState} 
+                        modelInfo={config.lowVram ? MODELS.low_vram : MODELS.standard} 
+                    />
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
