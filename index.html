@@ -180,7 +180,8 @@
             const [isRunning, setIsRunning] = useState(false);
             const [transcript, setTranscript] = useState([]);
             const [streamingContent, setStreamingContent] = useState("");
-            const [currentTurn, setCurrentTurn] = useState(null); // 'A' or 'B'
+            const [currentTurn, setCurrentTurn] = useState(null); 
+            const [gpuSupported, setGpuSupported] = useState(true);
             const stopSignal = useRef(false);
             const chatContainerRef = useRef(null);
 
@@ -193,11 +194,30 @@
                 agentB_prompt: "You are Sarah, a progressive sociology professor from Vermont. You believe in social equity, wealth redistribution, and strong safety nets. You are debating a capitalist. Be intellectual and citing historical examples. Keep answers under 2 sentences."
             });
 
+            // BUG FIX 4: Check WebGPU Support
+            useEffect(() => {
+                if (!navigator.gpu) {
+                    setGpuSupported(false);
+                    setLoadingState({ loading: false, text: "WebGPU Not Supported", progress: 0 });
+                }
+            }, []);
+
             // Initialize Engine
             const initEngine = async () => {
                 const targetConfig = config.lowVram ? MODELS.low_vram : MODELS.standard;
                 
-                if (engine && currentModelId === targetConfig.id) return engine;
+                // BUG FIX 2: VRAM Leak prevention. 
+                // If model ID changed and engine exists, we must unload first.
+                if (engine) {
+                    if (currentModelId === targetConfig.id) {
+                        return engine;
+                    } else {
+                        setLoadingState({ loading: true, text: "Unloading previous model...", progress: 0 });
+                        await engine.unload();
+                        setEngine(null);
+                        // Engine unloaded, proceed to create new one
+                    }
+                }
                 
                 try {
                     setLoadingState({ loading: true, text: "Loading Model Weights...", progress: 0.05 });
@@ -236,14 +256,28 @@
             };
 
             const generateResponse = async (activeEngine, promptSystem, history, currentSpeakerName, opponentName) => {
+                // BUG FIX 1: Context Window Crash
+                // Implement Sliding Window: Keep max ~10,000 chars of history to stay within tokens
+                const MAX_HISTORY_CHARS = 10000;
+                let currentChars = 0;
+                const prunedHistory = [];
+                
+                // Iterate backwards to keep most recent messages
+                for (let i = history.length - 1; i >= 0; i--) {
+                    const msgLen = history[i].content.length;
+                    if (currentChars + msgLen > MAX_HISTORY_CHARS) break;
+                    prunedHistory.unshift(history[i]);
+                    currentChars += msgLen;
+                }
+
                 const messages = [
                     { role: "system", content: `${promptSystem}\n\nContext: You are ${currentSpeakerName} debating ${opponentName}. Topic: "${config.topic}".` }
                 ];
 
-                if (history.length === 0) {
+                if (prunedHistory.length === 0 && history.length === 0) {
                     messages.push({ role: "user", content: `Opening statement regarding: ${config.topic}.` });
                 } else {
-                    history.forEach(msg => {
+                    prunedHistory.forEach(msg => {
                         const role = msg.name === currentSpeakerName ? "assistant" : "user";
                         messages.push({ role: role, content: msg.content });
                     });
@@ -264,7 +298,7 @@
                         if (delta) {
                             fullContent += delta;
                             setStreamingContent(fullContent);
-                            scrollToBottom();
+                            scrollToBottom(false); // Pass false to indicate auto-scroll
                         }
                     }
                     return fullContent;
@@ -289,7 +323,14 @@
 
                 const responseContent = await generateResponse(loadedEngine, prompt, currentTranscript, name, opponentName);
 
+                // BUG FIX 5: Lost Turn on Pause
+                // Even if we stopped, if we generated *something*, save it.
                 if (stopSignal.current) {
+                    if (responseContent && responseContent.length > 0) {
+                        const newMessage = { name, content: responseContent, isAgentA };
+                        const newTranscript = [...currentTranscript, newMessage];
+                        setTranscript(newTranscript);
+                    }
                     setIsRunning(false);
                     setStreamingContent("");
                     return;
@@ -301,7 +342,6 @@
                 setTranscript(newTranscript);
                 setStreamingContent("");
                 
-                // Small delay between turns
                 setTimeout(() => {
                     runDebateStep(loadedEngine, newTranscript, isAgentA ? 'B' : 'A');
                 }, 800);
@@ -317,7 +357,6 @@
                     if (!loadedEngine) return;
                     setIsRunning(true);
                     
-                    // Only clear transcript if starting fresh from 0
                     if(transcript.length === 0) {
                         runDebateStep(loadedEngine, [], 'A');
                     } else {
@@ -336,13 +375,23 @@
                 setCurrentTurn(null);
             };
 
-            const scrollToBottom = () => {
-                if (chatContainerRef.current) {
-                    chatContainerRef.current.scrollTop = chatContainerRef.current.scrollHeight;
+            // BUG FIX 3: Fighting the Scrollbar
+            const scrollToBottom = (force = true) => {
+                if (!chatContainerRef.current) return;
+                
+                const { scrollTop, scrollHeight, clientHeight } = chatContainerRef.current;
+                
+                // If force is true (manual user action or end of msg), scroll.
+                // If force is false (streaming), only scroll if user is already near bottom (100px threshold).
+                const isAtBottom = scrollHeight - scrollTop - clientHeight < 100;
+                
+                if (force || isAtBottom) {
+                    chatContainerRef.current.scrollTop = scrollHeight;
                 }
             };
             
-            useEffect(() => { scrollToBottom(); }, [transcript]);
+            // Effect when transcript grows (message completed)
+            useEffect(() => { scrollToBottom(true); }, [transcript]);
 
             const downloadTranscript = () => {
                 const text = transcript.map(t => `${t.name}: ${t.content}`).join('\n\n');
@@ -353,6 +402,17 @@
                 a.download = 'debate_transcript.txt';
                 a.click();
             };
+
+            // WebGPU Error Screen
+            if (!gpuSupported) {
+                return (
+                    <div className="h-screen w-screen bg-zinc-950 flex flex-col items-center justify-center text-zinc-400 p-8 text-center">
+                        <Icon name="triangle-exclamation" className="text-4xl text-yellow-500 mb-4" />
+                        <h1 className="text-xl font-bold text-white mb-2">WebGPU Not Supported</h1>
+                        <p className="max-w-md">Your browser does not support WebGPU, which is required to run this Local LLM application. Please try using the latest version of Chrome, Edge, or Brave on a desktop computer.</p>
+                    </div>
+                );
+            }
 
             return (
                 <div className="flex flex-col h-screen bg-zinc-950 text-zinc-300 overflow-hidden">
