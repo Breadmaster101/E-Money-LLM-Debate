@@ -5,7 +5,6 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>E-Money LLM Debate</title>
     
-    <!-- Tailwind CSS -->
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
         tailwind.config = {
@@ -27,17 +26,13 @@
         }
     </script>
     
-    <!-- React & ReactDOM -->
     <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
     
-    <!-- Babel for JSX -->
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
     
-    <!-- Markdown Renderer -->
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 
-    <!-- Icons -->
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 
@@ -67,7 +62,6 @@
         .no-resize { resize: none; }
     </style>
 
-    <!-- WebLLM Loader -->
     <script type="module">
         import * as webllm from "https://esm.run/@mlc-ai/web-llm";
         window.webllm = webllm;
@@ -97,6 +91,11 @@
                 lib: "Llama-3.2-1B-Instruct-q4f16_1-ctx4k_cs1k-webgpu.wasm",
                 context_size: 2048,
                 vram: "~880MB"
+            },
+            cerebras: {
+                id: "gpt-oss-120b",
+                name: "GPT-OSS-120B (Cerebras)",
+                vram: "Cloud API"
             }
         };
 
@@ -166,8 +165,8 @@
                     </div>
                     <div className="font-mono flex gap-4">
                         <span>VRAM: {modelInfo?.vram || "--"}</span>
-                        <span>CTX: {modelInfo?.context_size || "--"}</span>
-                        <span>WEBLLM</span>
+                        <span>CTX: {modelInfo?.context_size || "N/A"}</span>
+                        <span>{modelInfo?.id || "N/A"}</span>
                     </div>
                 </footer>
             );
@@ -184,30 +183,32 @@
             const [gpuSupported, setGpuSupported] = useState(true);
             const stopSignal = useRef(false);
             const chatContainerRef = useRef(null);
+            const lastRequestTimeRef = useRef(0);
 
             const [config, setConfig] = useState({
                 topic: "Is Capitalism better than Socialism?",
+                useCloud: false, 
                 lowVram: false,
+                cerebrasApiKey: "",
+                reqLimit: "30",
+                inputLimit: "60000",
+                dailyLimit: "1000000",
                 agentA_name: "Michael",
                 agentA_prompt: "You are Michael, a staunch conservative from Georgia. You believe in free markets, limited government, and individual liberty. You are debating a socialist. Be firm but respectful. Keep answers under 2 sentences.",
                 agentB_name: "Sarah",
                 agentB_prompt: "You are Sarah, a progressive sociology professor from Vermont. You believe in social equity, wealth redistribution, and strong safety nets. You are debating a capitalist. Be intellectual and citing historical examples. Keep answers under 2 sentences."
             });
 
-            // BUG FIX 4: Check WebGPU Support
             useEffect(() => {
                 if (!navigator.gpu) {
                     setGpuSupported(false);
-                    setLoadingState({ loading: false, text: "WebGPU Not Supported", progress: 0 });
                 }
             }, []);
 
-            // Initialize Engine
-            const initEngine = async () => {
+            // Initialize Engine (Only for Local)
+            const initLocalEngine = async () => {
                 const targetConfig = config.lowVram ? MODELS.low_vram : MODELS.standard;
                 
-                // BUG FIX 2: VRAM Leak prevention. 
-                // If model ID changed and engine exists, we must unload first.
                 if (engine) {
                     if (currentModelId === targetConfig.id) {
                         return engine;
@@ -215,7 +216,6 @@
                         setLoadingState({ loading: true, text: "Unloading previous model...", progress: 0 });
                         await engine.unload();
                         setEngine(null);
-                        // Engine unloaded, proceed to create new one
                     }
                 }
                 
@@ -255,14 +255,84 @@
                 }
             };
 
-            const generateResponse = async (activeEngine, promptSystem, history, currentSpeakerName, opponentName) => {
-                // BUG FIX 1: Context Window Crash
-                // Implement Sliding Window: Keep max ~10,000 chars of history to stay within tokens
+            const generateCerebrasResponse = async (promptSystem, history, currentSpeakerName, opponentName) => {
+                const messages = [
+                    { role: "system", content: `${promptSystem}\n\nContext: You are ${currentSpeakerName} debating ${opponentName}. Topic: "${config.topic}".` }
+                ];
+                
+                // Construct history for API
+                const recentHistory = history.slice(-20); 
+                recentHistory.forEach(msg => {
+                    const role = msg.name === currentSpeakerName ? "assistant" : "user";
+                    messages.push({ role: role, content: msg.content });
+                });
+
+                try {
+                    // Update Request Timestamp for Rate Limiting
+                    lastRequestTimeRef.current = Date.now();
+
+                    const response = await fetch("https://api.cerebras.ai/v1/chat/completions", {
+                        method: "POST",
+                        headers: {
+                            "Content-Type": "application/json",
+                            "Authorization": `Bearer ${config.cerebrasApiKey}`
+                        },
+                        body: JSON.stringify({
+                            model: "gpt-oss-120b",
+                            messages: messages,
+                            stream: true,
+                            temperature: 0.7,
+                            max_tokens: 4096 // INCREASED from 256 to prevent cut-offs
+                        })
+                    });
+
+                    if (!response.ok) {
+                        const err = await response.json().catch(() => ({}));
+                        throw new Error(err.error?.message || `API Error ${response.status}: ${response.statusText}`);
+                    }
+
+                    const reader = response.body.getReader();
+                    const decoder = new TextDecoder();
+                    let fullContent = "";
+
+                    while (true) {
+                        if (stopSignal.current) break;
+                        
+                        const { done, value } = await reader.read();
+                        if (done) break;
+
+                        const chunk = decoder.decode(value);
+                        const lines = chunk.split('\n');
+                        
+                        for (const line of lines) {
+                            if (line.startsWith('data: ') && line !== 'data: [DONE]') {
+                                try {
+                                    const data = JSON.parse(line.slice(6));
+                                    const delta = data.choices[0]?.delta?.content;
+                                    if (delta) {
+                                        fullContent += delta;
+                                        setStreamingContent(fullContent);
+                                        scrollToBottom(false);
+                                    }
+                                } catch (e) {
+                                    console.error("Parse error", e);
+                                }
+                            }
+                        }
+                    }
+                    return fullContent;
+
+                } catch (error) {
+                    console.error("Cerebras API Error:", error);
+                    return `[API Error: ${error.message}]`;
+                }
+            };
+
+            const generateLocalResponse = async (activeEngine, promptSystem, history, currentSpeakerName, opponentName) => {
                 const MAX_HISTORY_CHARS = 10000;
                 let currentChars = 0;
                 const prunedHistory = [];
                 
-                // Iterate backwards to keep most recent messages
                 for (let i = history.length - 1; i >= 0; i--) {
                     const msgLen = history[i].content.length;
                     if (currentChars + msgLen > MAX_HISTORY_CHARS) break;
@@ -285,7 +355,10 @@
 
                 try {
                     const completion = await activeEngine.chat.completions.create({
-                        messages, temperature: 0.7, max_tokens: 256, stream: true,
+                        messages, 
+                        temperature: 0.7, 
+                        max_tokens: 1024, // INCREASED from 256
+                        stream: true,
                     });
 
                     let fullContent = "";
@@ -298,7 +371,7 @@
                         if (delta) {
                             fullContent += delta;
                             setStreamingContent(fullContent);
-                            scrollToBottom(false); // Pass false to indicate auto-scroll
+                            scrollToBottom(false);
                         }
                     }
                     return fullContent;
@@ -321,10 +394,14 @@
                 const prompt = isAgentA ? config.agentA_prompt : config.agentB_prompt;
                 const opponentName = isAgentA ? config.agentB_name : config.agentA_name;
 
-                const responseContent = await generateResponse(loadedEngine, prompt, currentTranscript, name, opponentName);
+                let responseContent = "";
+                
+                if (config.useCloud) {
+                    responseContent = await generateCerebrasResponse(prompt, currentTranscript, name, opponentName);
+                } else {
+                    responseContent = await generateLocalResponse(loadedEngine, prompt, currentTranscript, name, opponentName);
+                }
 
-                // BUG FIX 5: Lost Turn on Pause
-                // Even if we stopped, if we generated *something*, save it.
                 if (stopSignal.current) {
                     if (responseContent && responseContent.length > 0) {
                         const newMessage = { name, content: responseContent, isAgentA };
@@ -342,9 +419,24 @@
                 setTranscript(newTranscript);
                 setStreamingContent("");
                 
+                // --- Rate Limiting Logic ---
+                let delay = 800;
+                
+                if (config.useCloud) {
+                    // Parse User RPM Limit (Default 30)
+                    const rpm = parseInt(config.reqLimit) || 30;
+                    const minInterval = (60000 / rpm) + 200; // +200ms buffer
+                    
+                    const timeSinceLast = Date.now() - lastRequestTimeRef.current;
+                    if (timeSinceLast < minInterval) {
+                        delay = minInterval - timeSinceLast;
+                        console.log(`Throttling for ${delay}ms to respect ${rpm} RPM`);
+                    }
+                }
+
                 setTimeout(() => {
                     runDebateStep(loadedEngine, newTranscript, isAgentA ? 'B' : 'A');
-                }, 800);
+                }, delay);
             };
 
             const toggleDebate = async () => {
@@ -353,14 +445,28 @@
                     setIsRunning(false);
                 } else {
                     stopSignal.current = false;
-                    const loadedEngine = await initEngine();
-                    if (!loadedEngine) return;
+                    
+                    let loadedEngine = null;
+                    
+                    if (config.useCloud) {
+                         if (!config.cerebrasApiKey) {
+                            alert("Please enter a Cerebras API Key.");
+                            return;
+                         }
+                         setLoadingState({ loading: false, text: "Cloud API Active", progress: 1 });
+                    } else {
+                        loadedEngine = await initLocalEngine();
+                        if (!loadedEngine) return;
+                    }
+                    
                     setIsRunning(true);
+                    
+                    // Reset rate limiter ref
+                    lastRequestTimeRef.current = 0;
                     
                     if(transcript.length === 0) {
                         runDebateStep(loadedEngine, [], 'A');
                     } else {
-                        // Determine whose turn it is
                         const lastWasA = transcript[transcript.length-1].isAgentA;
                         runDebateStep(loadedEngine, transcript, lastWasA ? 'B' : 'A');
                     }
@@ -375,22 +481,15 @@
                 setCurrentTurn(null);
             };
 
-            // BUG FIX 3: Fighting the Scrollbar
             const scrollToBottom = (force = true) => {
                 if (!chatContainerRef.current) return;
-                
                 const { scrollTop, scrollHeight, clientHeight } = chatContainerRef.current;
-                
-                // If force is true (manual user action or end of msg), scroll.
-                // If force is false (streaming), only scroll if user is already near bottom (100px threshold).
                 const isAtBottom = scrollHeight - scrollTop - clientHeight < 100;
-                
                 if (force || isAtBottom) {
                     chatContainerRef.current.scrollTop = scrollHeight;
                 }
             };
             
-            // Effect when transcript grows (message completed)
             useEffect(() => { scrollToBottom(true); }, [transcript]);
 
             const downloadTranscript = () => {
@@ -403,16 +502,25 @@
                 a.click();
             };
 
-            // WebGPU Error Screen
-            if (!gpuSupported) {
+            if (!gpuSupported && !config.useCloud) {
                 return (
                     <div className="h-screen w-screen bg-zinc-950 flex flex-col items-center justify-center text-zinc-400 p-8 text-center">
                         <Icon name="triangle-exclamation" className="text-4xl text-yellow-500 mb-4" />
                         <h1 className="text-xl font-bold text-white mb-2">WebGPU Not Supported</h1>
-                        <p className="max-w-md">Your browser does not support WebGPU, which is required to run this Local LLM application. Please try using the latest version of Chrome, Edge, or Brave on a desktop computer.</p>
+                        <p className="max-w-md mb-4">Your browser does not support WebGPU, which is required for local models.</p>
+                        <button 
+                            onClick={() => setConfig({...config, useCloud: true})}
+                            className="bg-orange-600 text-white px-4 py-2 rounded hover:bg-orange-700 transition"
+                        >
+                            Switch to Cloud Mode
+                        </button>
                     </div>
                 );
             }
+            
+            let currentModelInfo = MODELS.standard;
+            if (config.useCloud) currentModelInfo = MODELS.cerebras;
+            else if (config.lowVram) currentModelInfo = MODELS.low_vram;
 
             return (
                 <div className="flex flex-col h-screen bg-zinc-950 text-zinc-300 overflow-hidden">
@@ -423,7 +531,7 @@
                             <div className="w-5 h-5 bg-zinc-100 rounded-sm flex items-center justify-center text-zinc-900 font-bold text-xs">
                                 <Icon name="terminal" />
                             </div>
-                            <h1 className="text-sm font-semibold tracking-wide text-zinc-100">E-MONEY LLM DEBATE <span className="text-zinc-500 font-normal">v1.0</span></h1>
+                            <h1 className="text-sm font-semibold tracking-wide text-zinc-100">E-MONEY LLM DEBATE <span className="text-zinc-500 font-normal">v1.1</span></h1>
                         </div>
                         <div className="flex gap-2">
                             <button 
@@ -444,91 +552,179 @@
 
                     <div className="flex flex-1 overflow-hidden">
                         
-                        {/* Sidebar: Configuration */}
-                        <aside className="w-80 bg-zinc-900 border-r border-zinc-800 flex flex-col shrink-0 overflow-y-auto z-10">
-                            <div className="p-4 border-b border-zinc-800">
-                                <h2 className="text-xs font-bold text-zinc-400 uppercase tracking-widest mb-4">Configuration</h2>
-                                
-                                <SidebarInput 
-                                    label="Debate Topic" 
-                                    value={config.topic}
-                                    onChange={(e) => setConfig({...config, topic: e.target.value})}
-                                    rows={2}
-                                    type="textarea"
-                                    placeholder="Enter topic..."
-                                />
-
-                                <div className="flex items-center justify-between bg-zinc-950 p-2 rounded border border-zinc-800 mb-4">
-                                    <div className="text-xs">
-                                        <div className="font-semibold text-zinc-300">Resource Mode</div>
-                                        <div className="text-zinc-600">{config.lowVram ? "1B Model (Low VRAM)" : "3B Model (Standard)"}</div>
-                                    </div>
-                                    <button 
-                                        onClick={() => setConfig({...config, lowVram: !config.lowVram})}
-                                        className={`w-8 h-4 rounded-full relative transition-colors ${config.lowVram ? 'bg-green-600' : 'bg-zinc-700'}`}
-                                    >
-                                        <div className={`absolute top-0.5 left-0.5 w-3 h-3 bg-white rounded-full transition-transform duration-200 ${config.lowVram ? 'translate-x-4' : 'translate-x-0'}`}></div>
-                                    </button>
-                                </div>
-                            </div>
-
-                            <div className="p-4 flex-1 overflow-y-auto space-y-6">
-                                {/* Agent A Config */}
-                                <div>
-                                    <div className="flex items-center gap-2 mb-2 text-blue-400 text-xs font-bold uppercase">
-                                        <Icon name="user-tie" /> Agent A (Proponent)
-                                    </div>
+                        {/* Sidebar: Restructured for fixed footer */}
+                        <aside className="w-80 bg-zinc-900 border-r border-zinc-800 shrink-0 z-10 flex flex-col">
+                            
+                            {/* Scrollable Content Container */}
+                            <div className="flex-1 overflow-y-auto custom-scrollbar">
+                                {/* Section 1: Top Config */}
+                                <div className="p-4 border-b border-zinc-800">
+                                    <h2 className="text-xs font-bold text-zinc-400 uppercase tracking-widest mb-4">Configuration</h2>
+                                    
                                     <SidebarInput 
-                                        label="Name" 
-                                        value={config.agentA_name} 
-                                        onChange={(e) => setConfig({...config, agentA_name: e.target.value})} 
-                                    />
-                                    <SidebarInput 
-                                        label="System Prompt" 
+                                        label="Debate Topic" 
+                                        value={config.topic}
+                                        onChange={(e) => setConfig({...config, topic: e.target.value})}
+                                        rows={2}
                                         type="textarea"
-                                        rows={4}
-                                        value={config.agentA_prompt} 
-                                        onChange={(e) => setConfig({...config, agentA_prompt: e.target.value})} 
+                                        placeholder="Enter topic..."
                                     />
-                                </div>
 
-                                {/* Agent B Config */}
-                                <div>
-                                    <div className="flex items-center gap-2 mb-2 text-orange-400 text-xs font-bold uppercase">
-                                        <Icon name="user-graduate" /> Agent B (Opponent)
+                                    {/* Model Source Selector */}
+                                    <div className="bg-zinc-950 p-2 rounded border border-zinc-800 mb-4">
+                                        <div className="text-xs font-semibold text-zinc-300 mb-2 uppercase">Inference Engine</div>
+                                        <div className="flex bg-zinc-900 rounded p-0.5 border border-zinc-800">
+                                            <button 
+                                                onClick={() => setConfig({...config, useCloud: false})}
+                                                className={`flex-1 py-1.5 text-[10px] font-bold uppercase rounded-sm transition-colors ${!config.useCloud ? 'bg-zinc-700 text-white' : 'text-zinc-500 hover:text-zinc-300'}`}
+                                            >
+                                                Local (WebGPU)
+                                            </button>
+                                            <button 
+                                                onClick={() => setConfig({...config, useCloud: true})}
+                                                className={`flex-1 py-1.5 text-[10px] font-bold uppercase rounded-sm transition-colors ${config.useCloud ? 'bg-orange-600 text-white' : 'text-zinc-500 hover:text-zinc-300'}`}
+                                            >
+                                                Cloud (Cerebras)
+                                            </button>
+                                        </div>
+
+                                        {/* Local Settings */}
+                                        {!config.useCloud && (
+                                            <div className="mt-3 flex items-center justify-between border-t border-zinc-800 pt-3">
+                                                <div className="text-xs text-zinc-500">
+                                                    {config.lowVram ? "Llama 3.2 1B (Low VRAM)" : "Llama 3.2 3B (Standard)"}
+                                                </div>
+                                                <button 
+                                                    onClick={() => setConfig({...config, lowVram: !config.lowVram})}
+                                                    className={`w-8 h-4 rounded-full relative transition-colors ${config.lowVram ? 'bg-green-600' : 'bg-zinc-700'}`}
+                                                    title="Toggle Low VRAM Mode"
+                                                >
+                                                    <div className={`absolute top-0.5 left-0.5 w-3 h-3 bg-white rounded-full transition-transform duration-200 ${config.lowVram ? 'translate-x-4' : 'translate-x-0'}`}></div>
+                                                </button>
+                                            </div>
+                                        )}
+
+                                        {/* Cloud Settings */}
+                                        {config.useCloud && (
+                                            <div className="mt-3 space-y-3 border-t border-zinc-800 pt-3">
+                                                <div>
+                                                    <label className="block text-[10px] font-semibold text-zinc-500 uppercase mb-1">Cerebras API Key</label>
+                                                    <input 
+                                                        type="password" 
+                                                        value={config.cerebrasApiKey}
+                                                        onChange={(e) => setConfig({...config, cerebrasApiKey: e.target.value})}
+                                                        className="w-full bg-zinc-900 border border-zinc-700 rounded-sm p-1.5 text-xs text-zinc-300 focus:border-orange-500 focus:outline-none"
+                                                        placeholder="sk-..."
+                                                    />
+                                                </div>
+                                                
+                                                <div>
+                                                    <label className="block text-[10px] font-semibold text-zinc-500 uppercase mb-1">Limits Configuration</label>
+                                                    <div className="grid grid-cols-2 gap-2">
+                                                        <div>
+                                                            <span className="text-[9px] text-zinc-600 block">Reqs/min</span>
+                                                            <input 
+                                                                type="text" 
+                                                                value={config.reqLimit}
+                                                                onChange={(e) => setConfig({...config, reqLimit: e.target.value})}
+                                                                className="w-full bg-zinc-900 border border-zinc-700 rounded-sm p-1 text-xs text-zinc-300"
+                                                            />
+                                                        </div>
+                                                        <div>
+                                                            <span className="text-[9px] text-zinc-600 block">Input Tok/min</span>
+                                                            <input 
+                                                                type="text" 
+                                                                value={config.inputLimit}
+                                                                onChange={(e) => setConfig({...config, inputLimit: e.target.value})}
+                                                                className="w-full bg-zinc-900 border border-zinc-700 rounded-sm p-1 text-xs text-zinc-300"
+                                                            />
+                                                        </div>
+                                                        <div className="col-span-2">
+                                                            <span className="text-[9px] text-zinc-600 block">Daily Tokens</span>
+                                                            <input 
+                                                                type="text" 
+                                                                value={config.dailyLimit}
+                                                                onChange={(e) => setConfig({...config, dailyLimit: e.target.value})}
+                                                                className="w-full bg-zinc-900 border border-zinc-700 rounded-sm p-1 text-xs text-zinc-300"
+                                                            />
+                                                        </div>
+                                                    </div>
+                                                </div>
+
+                                                <div className="text-[10px] text-zinc-600 italic">
+                                                    Using model: <span className="text-orange-400">gpt-oss-120b</span>
+                                                </div>
+                                            </div>
+                                        )}
                                     </div>
-                                    <SidebarInput 
-                                        label="Name" 
-                                        value={config.agentB_name} 
-                                        onChange={(e) => setConfig({...config, agentB_name: e.target.value})} 
-                                    />
-                                    <SidebarInput 
-                                        label="System Prompt" 
-                                        type="textarea"
-                                        rows={4}
-                                        value={config.agentB_prompt} 
-                                        onChange={(e) => setConfig({...config, agentB_prompt: e.target.value})} 
-                                    />
                                 </div>
-                            </div>
 
-                            <div className="p-4 border-t border-zinc-800 bg-zinc-900">
+                                {/* Section 2: Prompts */}
+                                <div className="p-4 space-y-6">
+                                    {/* Agent A Config */}
+                                    <div>
+                                        <div className="flex items-center gap-2 mb-2 text-blue-400 text-xs font-bold uppercase">
+                                            <Icon name="user-tie" /> Agent A (Proponent)
+                                        </div>
+                                        <SidebarInput 
+                                            label="Name" 
+                                            value={config.agentA_name} 
+                                            onChange={(e) => setConfig({...config, agentA_name: e.target.value})} 
+                                        />
+                                        <SidebarInput 
+                                            label="System Prompt" 
+                                            type="textarea"
+                                            rows={4}
+                                            value={config.agentA_prompt} 
+                                            onChange={(e) => setConfig({...config, agentA_prompt: e.target.value})} 
+                                        />
+                                    </div>
+
+                                    {/* Agent B Config */}
+                                    <div>
+                                        <div className="flex items-center gap-2 mb-2 text-orange-400 text-xs font-bold uppercase">
+                                            <Icon name="user-graduate" /> Agent B (Opponent)
+                                        </div>
+                                        <SidebarInput 
+                                            label="Name" 
+                                            value={config.agentB_name} 
+                                            onChange={(e) => setConfig({...config, agentB_name: e.target.value})} 
+                                        />
+                                        <SidebarInput 
+                                            label="System Prompt" 
+                                            type="textarea"
+                                            rows={4}
+                                            value={config.agentB_prompt} 
+                                            onChange={(e) => setConfig({...config, agentB_prompt: e.target.value})} 
+                                        />
+                                    </div>
+                                </div>
+                            </div> {/* End Scrollable Content Container */}
+
+                            {/* Section 3: Start/Pause/Resume Button (Fixed Footer) */}
+                            <div className="p-4 border-t border-zinc-800 bg-zinc-900 shrink-0">
                                 <button 
                                     onClick={toggleDebate}
-                                    disabled={loadingState.loading && loadingState.progress < 1}
+                                    disabled={!config.useCloud && loadingState.loading && loadingState.progress < 1}
                                     className={`w-full py-2.5 px-4 text-xs font-bold uppercase tracking-wider rounded-sm transition flex items-center justify-center gap-2
                                         ${isRunning 
                                             ? 'bg-zinc-800 text-red-400 border border-zinc-700 hover:bg-zinc-700' 
-                                            : 'bg-zinc-100 text-zinc-900 hover:bg-white'}
-                                        ${loadingState.loading ? 'opacity-50 cursor-not-allowed' : ''}
+                                            : config.useCloud 
+                                                ? 'bg-zinc-100 text-zinc-900 hover:bg-white'
+                                                : 'bg-zinc-100 text-zinc-900 hover:bg-white'}
+                                        ${(!config.useCloud && loadingState.loading) ? 'opacity-50 cursor-not-allowed' : ''}
                                     `}
                                 >
-                                    {loadingState.loading ? (
+                                    {loadingState.loading && !config.useCloud ? (
                                         <><Icon name="spinner" className="fa-spin" /> Initializing</>
                                     ) : isRunning ? (
                                         <><Icon name="pause" /> Pause Debate</>
                                     ) : (
-                                        <><Icon name="play" /> Start Debate</>
+                                        transcript.length > 0 ? (
+                                            <><Icon name="play" /> Resume Debate</>
+                                        ) : (
+                                            <><Icon name="play" /> Start Debate</>
+                                        )
                                     )}
                                 </button>
                             </div>
@@ -580,7 +776,7 @@
                             )}
 
                             {/* Loading Overlay (First Load Only) */}
-                            {loadingState.loading && loadingState.progress < 1 && (
+                            {loadingState.loading && loadingState.progress < 1 && !config.useCloud && (
                                 <div className="absolute inset-0 bg-zinc-950/80 backdrop-blur-sm z-50 flex items-center justify-center">
                                     <div className="w-64">
                                         <div className="flex justify-between text-xs text-zinc-400 mb-2 font-mono">
@@ -599,7 +795,7 @@
 
                     <StatusFooter 
                         status={loadingState} 
-                        modelInfo={config.lowVram ? MODELS.low_vram : MODELS.standard} 
+                        modelInfo={currentModelInfo} 
                     />
                 </div>
             );
